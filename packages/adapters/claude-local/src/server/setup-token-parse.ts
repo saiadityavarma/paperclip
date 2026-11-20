@@ -182,8 +182,34 @@ const URL_PREAMBLE_RE = /the url below to sign in/i;
 const PROMPT_LINE_RE = /^Paste code here if prompted\b[\s>*]*$/;
 
 // The copy hint that `claude` 2.1.291 prints between the URL block and the
-// prompt. The parser skips this exact line and binds no value from it.
-const COPY_HINT_LINE_RE = /^Hold\s+Shift\s+while\s+selecting\s+to\s+use\s+your\s+terminal['’]s\s+native\s+copy\.?$/i;
+// prompt. Other releases add a short parenthetical of terminal-specific keys
+// (`Hold Shift (Option in iTerm2, Fn in Terminal.app) while ...`), and the
+// longer hint wraps at the PTY width. The parser skips this exact phrase and
+// binds no value from it.
+const COPY_HINT_LINE_RE = /^Hold\s+Shift(?:\s+\([^()]{1,80}\))?\s+while\s+selecting\s+to\s+use\s+your\s+terminal['’]s\s+native\s+copy\.?$/i;
+
+// Claude Code 2.1.306 prints the selected login method between its copy hint
+// and the browser-code prompt. This is informational output, not a prompt.
+const LOGIN_METHOD_LINE_RE = /^Login method pre-selected:\s+Subscription Plan \(Claude Pro\/Max\)$/;
+
+// The maximum number of consecutive physical lines a wrapped copy hint spans.
+const MAX_COPY_HINT_LINES = 3;
+
+/**
+ * Returns the last line index of a copy hint that starts at `start`, or null.
+ * Joins at most {@link MAX_COPY_HINT_LINES} consecutive non-blank lines and
+ * returns once the joined text matches {@link COPY_HINT_LINE_RE} exactly.
+ */
+function copyHintEndLine(lines: string[], start: number): number | null {
+  let joined = "";
+  for (let i = start; i < lines.length && i < start + MAX_COPY_HINT_LINES; i += 1) {
+    const trimmed = lines[i].trim();
+    if (trimmed.length === 0) return null;
+    joined = joined ? `${joined} ${trimmed}` : trimmed;
+    if (COPY_HINT_LINE_RE.test(joined)) return i;
+  }
+  return null;
+}
 
 // The maximum number of characters between the end of the URL preamble line and
 // the start of the URL. The Claude UI prints the URL right after the preamble.
@@ -381,7 +407,12 @@ function findBrowserCodePrompt(lines: string[], endLine: number, url: string): s
     // punctuation first, the same way the repeated-URL comparison needs, so a
     // repeated URL with a trailing punctuation mark still matches.
     if (trimmed.replace(TRAILING_PUNCTUATION_RE, "") === url) continue;
-    if (COPY_HINT_LINE_RE.test(trimmed)) continue;
+    if (LOGIN_METHOD_LINE_RE.test(trimmed)) continue;
+    const hintEnd = copyHintEndLine(lines, i);
+    if (hintEnd !== null) {
+      i = hintEnd;
+      continue;
+    }
     return PROMPT_LINE_RE.test(trimmed) ? SETUP_TOKEN_PROMPT : null;
   }
   return null;
@@ -434,9 +465,17 @@ export function parseSetupTokenPrompt(text: string): SetupTokenPrompt | null {
 // prints a token that starts with this exact prefix. The opaque tail follows.
 export const SETUP_TOKEN_PREFIX = "sk-ant-oat01-";
 
-// The line that introduces the token. The success screen prints this exact line
-// right before the token block. The token parser binds the token to this anchor.
+// The line that introduces the token. Claude Code up to 2.1.3xx printed this
+// exact line right before the token block. The token parser binds the token to
+// this anchor.
 export const SETUP_TOKEN_BEFORE_ANCHOR = "Your OAuth token (valid for 1 year):";
+
+// Newer Claude Code builds the before-anchor from the token's expiry, so the
+// validity text varies ("1 year", "365 days", ...). The parser accepts the fixed
+// prefix and suffix around a short alphanumeric validity phrase.
+export const SETUP_TOKEN_BEFORE_ANCHOR_PREFIX = "Your OAuth token (valid for ";
+export const SETUP_TOKEN_BEFORE_ANCHOR_SUFFIX = "):";
+const SETUP_TOKEN_VALIDITY_RE = /^[A-Za-z0-9 \u0000]{1,32}$/;
 
 // The line that follows the token. The success screen prints this exact line
 // right after the token block. The token parser binds the token to this anchor.
@@ -455,15 +494,77 @@ const TOKEN_FRAGMENT_RE = /^[A-Za-z0-9_-]+$/;
 // opaque tail is far longer than this floor.
 const FULL_TOKEN_RE = /^sk-ant-oat01-[A-Za-z0-9_-]{20,}$/;
 
+// A cell the terminal skipped with a cursor-forward move. The Claude UI redraws
+// in place and skips a cell that already shows the right character from the
+// prior frame, so an anchor line can arrive as `see\x1b[1C\x1b[1Ct again.`. The
+// credential parser keeps each skipped cell as this placeholder, so the column
+// count of the line stays exact.
+const SKIPPED_CELL = "\u0000";
+
+// The maximum cell count one cursor-forward move expands to.
+const MAX_CURSOR_FORWARD_CELLS = 256;
+
+const CSI_CURSOR_FORWARD_RE = /\x1b\[(\d*)C/g;
+
+const EDGE_CELLS_RE = /^[\s\u0000]+|[\s\u0000]+$/g;
+
 /**
- * Returns the index of the one line that equals `anchor` after a trim. Returns
+ * Removes the terminal controls like {@link stripTerminalControls}, but expands
+ * each cursor-forward move to one {@link SKIPPED_CELL} per skipped column.
+ */
+function stripTerminalControlsKeepingCells(text: string): string {
+  return stripTerminalControls(text.replace(CSI_CURSOR_FORWARD_RE, (_match, count: string) =>
+    SKIPPED_CELL.repeat(Math.min(Math.max(Number(count || "1"), 1), MAX_CURSOR_FORWARD_CELLS))));
+}
+
+/** Trims whitespace and skipped cells from both ends of a physical line. */
+function trimCells(line: string): string {
+  return line.replace(EDGE_CELLS_RE, "");
+}
+
+/**
+ * Returns true when `line` shows `anchor` column for column. A skipped cell may
+ * stand in for any inner anchor character, because the terminal skipped a cell
+ * that already showed it. The first and last anchor characters must be literal,
+ * so the edge trim can never shorten a match. A skipped cell never stands in for
+ * a token character; the token fragment test rejects it.
+ */
+function anchorLineMatches(line: string, anchor: string): boolean {
+  const trimmed = trimCells(line);
+  if (trimmed.length !== anchor.length) return false;
+  for (let i = 0; i < anchor.length; i += 1) {
+    if (trimmed[i] === anchor[i]) continue;
+    if (trimmed[i] === SKIPPED_CELL && i > 0 && i < anchor.length - 1) continue;
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Returns true when `line` shows the before-anchor with any short validity
+ * phrase. The prefix and suffix follow the {@link anchorLineMatches} rules; the
+ * validity phrase must hold at least one literal letter or digit.
+ */
+function beforeAnchorLineMatches(line: string): boolean {
+  const trimmed = trimCells(line);
+  const head = SETUP_TOKEN_BEFORE_ANCHOR_PREFIX.length;
+  const tail = SETUP_TOKEN_BEFORE_ANCHOR_SUFFIX.length;
+  if (trimmed.length <= head + tail) return false;
+  const validity = trimmed.slice(head, trimmed.length - tail);
+  if (!SETUP_TOKEN_VALIDITY_RE.test(validity) || !/[A-Za-z0-9]/.test(validity)) return false;
+  return anchorLineMatches(line, SETUP_TOKEN_BEFORE_ANCHOR_PREFIX + validity + SETUP_TOKEN_BEFORE_ANCHOR_SUFFIX);
+}
+
+/**
+ * Returns the index of the one line that matches `anchor` after a trim. Returns
  * null when no line matches. Returns null when more than one line matches, so a
  * duplicate success block fails closed.
  */
-function singleAnchorIndex(lines: string[], anchor: string): number | null {
+function singleAnchorIndex(lines: string[], anchor: string | ((line: string) => boolean)): number | null {
+  const matches = typeof anchor === "string" ? (line: string) => anchorLineMatches(line, anchor) : anchor;
   let found: number | null = null;
   for (let i = 0; i < lines.length; i += 1) {
-    if (lines[i].trim() !== anchor) continue;
+    if (!matches(lines[i])) continue;
     if (found !== null) return null;
     found = i;
   }
@@ -491,7 +592,7 @@ function singleAnchorIndex(lines: string[], anchor: string): number | null {
  */
 export function parseSetupTokenCredential(text: string): string | null {
   if (typeof text !== "string" || text.length === 0) return null;
-  const clean = stripTerminalControls(text);
+  const clean = stripTerminalControlsKeepingCells(text);
   // Canonicalize the record delimiter. The real terminal redraw joins the
   // before-anchor line, the token, and the after-anchor line with a bare
   // carriage return, or a CRLF pair, instead of a line feed. Map each CRLF and
@@ -502,7 +603,7 @@ export function parseSetupTokenCredential(text: string): string | null {
   const normalized = clean.replace(/\r\n|\r/g, "\n");
   const lines = normalized.split("\n");
 
-  const beforeIndex = singleAnchorIndex(lines, SETUP_TOKEN_BEFORE_ANCHOR);
+  const beforeIndex = singleAnchorIndex(lines, beforeAnchorLineMatches);
   const afterIndex = singleAnchorIndex(lines, SETUP_TOKEN_AFTER_ANCHOR);
   if (beforeIndex === null || afterIndex === null) return null;
   if (afterIndex <= beforeIndex) return null;
@@ -512,7 +613,7 @@ export function parseSetupTokenCredential(text: string): string | null {
   // line, fails the fragment test and the parser returns null.
   const fragments: string[] = [];
   for (let i = beforeIndex + 1; i < afterIndex; i += 1) {
-    const trimmed = lines[i].trim();
+    const trimmed = trimCells(lines[i]);
     if (trimmed.length === 0) continue;
     if (!TOKEN_FRAGMENT_RE.test(trimmed)) return null;
     fragments.push(trimmed);
@@ -522,4 +623,106 @@ export function parseSetupTokenCredential(text: string): string | null {
   const token = fragments.join("");
   if (!FULL_TOKEN_RE.test(token)) return null;
   return token;
+}
+
+const CSI_AT_RE = /^\x1b\[([0-?]*)([ -/]*)([@-~])/;
+const CHARSET_AT_RE = /^\x1b[()*+][\x20-\x7e]/;
+
+const MAX_RENDER_ROWS = 2048;
+
+const MAX_RENDER_COLS = 1024;
+
+export function renderTerminalScreen(text: string): string {
+  const rows: string[][] = [[]];
+  let row = 0;
+  let col = 0;
+  let saved = { row: 0, col: 0 };
+  const ensureRow = (r: number) => {
+    while (rows.length <= r && rows.length < MAX_RENDER_ROWS) rows.push([]);
+  };
+  const moveTo = (r: number, c: number) => {
+    row = Math.max(0, Math.min(r, MAX_RENDER_ROWS - 1));
+    col = Math.max(0, Math.min(c, MAX_RENDER_COLS - 1));
+    ensureRow(row);
+  };
+
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === "\x1b") {
+      const rest = text.slice(i, i + 256);
+      const csi = CSI_AT_RE.exec(rest);
+      if (csi) {
+        i += csi[0].length;
+        const [, rawParams, intermediates, final] = csi;
+        if (intermediates || /^[<=>?]/.test(rawParams)) continue;
+        const params = rawParams.split(";").map((value) => Number.parseInt(value, 10));
+        const n = Number.isFinite(params[0]) && params[0] > 0 ? params[0] : 1;
+        switch (final) {
+          case "A": moveTo(row - n, col); break;
+          case "B": moveTo(row + n, col); break;
+          case "C": moveTo(row, col + n); break;
+          case "D": moveTo(row, col - n); break;
+          case "E": moveTo(row + n, 0); break;
+          case "F": moveTo(row - n, 0); break;
+          case "G": moveTo(row, n - 1); break;
+          case "H":
+          case "f": {
+            const c = Number.isFinite(params[1]) && params[1] > 0 ? params[1] : 1;
+            moveTo(n - 1, c - 1);
+            break;
+          }
+          case "K": {
+            const mode = Number.isFinite(params[0]) ? params[0] : 0;
+            const line = rows[row];
+            if (mode === 0) line.length = Math.min(line.length, col);
+            else if (mode === 1) for (let c = 0; c <= col && c < line.length; c += 1) line[c] = " ";
+            else line.length = 0;
+            break;
+          }
+          case "J": {
+            const mode = Number.isFinite(params[0]) ? params[0] : 0;
+            if (mode === 0) {
+              rows[row].length = Math.min(rows[row].length, col);
+              rows.length = row + 1;
+            } else if (mode === 2 || mode === 3) {
+              for (const line of rows) line.length = 0;
+            }
+            break;
+          }
+          case "s": saved = { row, col }; break;
+          case "u": moveTo(saved.row, saved.col); break;
+          default: break;
+        }
+        continue;
+      }
+      if (text[i + 1] === "]") {
+        const bell = text.indexOf("\x07", i + 2);
+        const st = text.indexOf("\x1b\\", i + 2);
+        const ends = [bell === -1 ? -1 : bell + 1, st === -1 ? -1 : st + 2].filter((end) => end !== -1);
+        i = ends.length > 0 ? Math.min(...ends) : text.length;
+        continue;
+      }
+      const charset = CHARSET_AT_RE.exec(rest);
+      if (charset) { i += charset[0].length; continue; }
+      const next = text[i + 1];
+      if (next === "7") saved = { row, col };
+      else if (next === "8") moveTo(saved.row, saved.col);
+      i += next === undefined ? 1 : 2;
+      continue;
+    }
+    i += 1;
+    if (ch === "\r") { col = 0; continue; }
+    if (ch === "\n") { moveTo(row + 1, 0); continue; }
+    if (ch === "\b") { moveTo(row, col - 1); continue; }
+    if (ch === "\t") { moveTo(row, (Math.floor(col / 8) + 1) * 8); continue; }
+    if (ch < " " || ch === "\x7f") continue;
+    if (col < MAX_RENDER_COLS) {
+      const line = rows[row];
+      while (line.length < col) line.push(" ");
+      line[col] = ch;
+      col += 1;
+    }
+  }
+  return rows.map((line) => line.join("").trimEnd()).join("\n");
 }

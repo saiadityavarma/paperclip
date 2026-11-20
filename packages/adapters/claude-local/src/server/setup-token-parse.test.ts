@@ -12,6 +12,7 @@ import {
   SETUP_TOKEN_URL_QUERY_KEYS,
   parseSetupTokenCredential,
   parseSetupTokenPrompt,
+  renderTerminalScreen,
 } from "./setup-token-parse.js";
 
 const fixturesDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "__fixtures__");
@@ -345,6 +346,43 @@ describe("parseSetupTokenPrompt", () => {
     expect(result?.prompt).toBe(SETUP_TOKEN_PROMPT);
   });
 
+  it("skips a wrapped copy hint with a terminal-key parenthetical", () => {
+    const text = [
+      PREAMBLE_LINE,
+      hardWrap(CLAUDE_COM_URL, 80),
+      "",
+      "Hold Shift (Option in iTerm2, Fn in Terminal.app) while selecting to use your",
+      "terminal's native copy",
+      "",
+      PROMPT_LINE,
+    ].join("\n");
+    const result = parseSetupTokenPrompt(text);
+    expect(result?.url).toBe(CLAUDE_COM_URL);
+    expect(result?.prompt).toBe(SETUP_TOKEN_PROMPT);
+  });
+
+  it("skips the 2.1.306 login-method status line before the prompt", () => {
+    const text = [
+      PREAMBLE_LINE,
+      CLAUDE_COM_URL,
+      "Hold Shift while selecting to use your terminal's native copy",
+      "Login method pre-selected: Subscription Plan (Claude Pro/Max)",
+      PROMPT_LINE,
+    ].join("\n");
+    expect(parseSetupTokenPrompt(text)?.url).toBe(CLAUDE_COM_URL);
+  });
+
+  it("returns null when a copy hint continuation carries other prose", () => {
+    const text = [
+      PREAMBLE_LINE,
+      CLAUDE_COM_URL,
+      "Hold Shift (Option in iTerm2) while selecting to use your",
+      "terminal's native copy and paste ABCD-EFGHJ",
+      PROMPT_LINE,
+    ].join("\n");
+    expect(parseSetupTokenPrompt(text)).toBeNull();
+  });
+
   it("returns null when a code-like value sits on the line after the URL", () => {
     // The line right after the URL must hold the browser-code prompt. A code-like
     // value on that line cannot bind, so the parser returns null.
@@ -505,6 +543,51 @@ function successScreen(body: string[]): string {
 }
 
 describe("parseSetupTokenCredential", () => {
+  it.each(["365 days", "8760 hours", "11 months"])(
+    "reads the token when the before-anchor shows a computed validity (%s)",
+    (validity) => {
+      const text = successScreen([TOKEN_FRAGMENT_A, TOKEN_FRAGMENT_B])
+        .replace(SETUP_TOKEN_BEFORE_ANCHOR, `Your OAuth token (valid for ${validity}):`);
+      expect(parseSetupTokenCredential(text)).toBe(FULL_TOKEN);
+    },
+  );
+
+  it("reads a computed-validity before-anchor drawn with cursor-forward moves", () => {
+    const before = "Your OAuth token (valid for 365 days):".split(" ").join("\x1b[1C");
+    const text = successScreen([TOKEN_FRAGMENT_A, TOKEN_FRAGMENT_B]).replace(SETUP_TOKEN_BEFORE_ANCHOR, before);
+    expect(parseSetupTokenCredential(text)).toBe(FULL_TOKEN);
+  });
+
+  it.each(["", "   ", "1 year) and more (", "a".repeat(40)])(
+    "returns null when the validity phrase is empty or not a short phrase (%j)",
+    (validity) => {
+      const text = successScreen([TOKEN_FRAGMENT_A, TOKEN_FRAGMENT_B])
+        .replace(SETUP_TOKEN_BEFORE_ANCHOR, `Your OAuth token (valid for ${validity}):`);
+      expect(parseSetupTokenCredential(text)).toBeNull();
+    },
+  );
+
+  it("reads anchors whose spaces and redrawn letters arrive as cursor-forward moves", () => {
+    // The live 2.1.289 redraw emits each space as `ESC[1C` and skips a cell that
+    // already shows the right letter from the prior frame (the `i` of `it`).
+    const before = SETUP_TOKEN_BEFORE_ANCHOR.split(" ").join("\x1b[1C");
+    const after = "Store\x1b[1Cthis\x1b[1Ctoken\x1b[1Csecurely.\x1b[1CYou\x1b[1Cwon't\x1b[1Cbe\x1b[1Cable\x1b[1Cto\x1b[1Csee\x1b[2Ct\x1b[1Cagain.";
+    const text = ["\x1b[2C" + before, "\x1b[2C" + TOKEN_FRAGMENT_A, "\x1b[2C" + TOKEN_FRAGMENT_B, after].join("\r\r\n");
+    expect(parseSetupTokenCredential(text)).toBe(FULL_TOKEN);
+  });
+
+  it("returns null when a skipped cell sits inside a token fragment", () => {
+    const gapped = `${TOKEN_FRAGMENT_A.slice(0, 20)}\x1b[1C${TOKEN_FRAGMENT_A.slice(21)}`;
+    const text = successScreen([gapped, TOKEN_FRAGMENT_B]);
+    expect(parseSetupTokenCredential(text)).toBeNull();
+  });
+
+  it("returns null when a skipped cell replaces an anchor edge character", () => {
+    const text = successScreen([TOKEN_FRAGMENT_A, TOKEN_FRAGMENT_B])
+      .replace(SETUP_TOKEN_AFTER_ANCHOR, `${SETUP_TOKEN_AFTER_ANCHOR.slice(0, -1)}\x1b[1C`);
+    expect(parseSetupTokenCredential(text)).toBeNull();
+  });
+
   it("returns the de-wrapped token from the exact success record once", () => {
     const text = successScreen([TOKEN_FRAGMENT_A, TOKEN_FRAGMENT_B]);
     expect(parseSetupTokenCredential(text)).toBe(FULL_TOKEN);
@@ -692,5 +775,72 @@ describe("parseSetupTokenCredential", () => {
     expect(fixture).toContain(SETUP_TOKEN_BEFORE_ANCHOR);
     expect(fixture).toContain(SETUP_TOKEN_AFTER_ANCHOR);
     expect(fixture).toContain(SETUP_TOKEN_PREFIX);
+  });
+});
+
+function inkDiffRedraw(prev: string[], next: string[]): string {
+  let out = `\x1b[${prev.length}A`;
+  for (let row = 0; row < next.length; row += 1) {
+    const before = prev[row] ?? "";
+    const after = next[row];
+    out += "\r";
+    let skipped = false;
+    for (let col = 0; col < after.length; col += 1) {
+      if (before[col] === after[col]) { skipped = true; continue; }
+      if (skipped) { out += `\x1b[${col + 1}G`; skipped = false; }
+      out += after[col];
+    }
+    if (before.length > after.length) out += "\x1b[K";
+    out += "\x1b[1B";
+  }
+  return out;
+}
+
+describe("renderTerminalScreen", () => {
+  const PROMPT_FRAME = [
+    " Browser didn't open? Use the url below to sign in (c to copy)",
+    "",
+    ` ${VALID_URL}`,
+    "",
+    " Hold Shift while selecting to use your terminal's native copy",
+    "",
+    " Paste code here if prompted >",
+  ];
+  const SUCCESS_FRAME = [
+    " Long-lived authentication token created successfully!",
+    ` ${SETUP_TOKEN_BEFORE_ANCHOR}`,
+    "",
+    ` ${FULL_TOKEN}`,
+    ` ${SETUP_TOKEN_AFTER_ANCHOR}`,
+    "",
+    "",
+  ];
+
+  it("recovers the success record from a 2.1.3xx diff redraw", () => {
+    const stream = `${PROMPT_FRAME.join("\r\n")}\r\n${inkDiffRedraw(PROMPT_FRAME, SUCCESS_FRAME)}`;
+    expect(stream).toContain("token\x1b[21Gcurely");
+    expect(parseSetupTokenCredential(stream)).toBeNull();
+    expect(parseSetupTokenCredential(renderTerminalScreen(stream))).toBe(FULL_TOKEN);
+  });
+
+  it("applies cursor moves, erase in line, and cursor save and restore", () => {
+    expect(renderTerminalScreen("abc\r\nxyz\x1b[1A\x1b[2Gq")).toBe("aqc\nxyz");
+    expect(renderTerminalScreen("hello world\r\x1b[6C\x1b[K")).toBe("hello");
+    expect(renderTerminalScreen("ab\x1b7\r\ncd\x1b8Z")).toBe("abZ\ncd");
+  });
+
+  it("drops an OSC 8 target longer than any lookahead window", () => {
+    const url = `${VALID_URL}&pad=${"x".repeat(300)}`;
+    expect(renderTerminalScreen(`\x1b]8;id=1;${url}\x07shown\x1b]8;;\x07`)).toBe("shown");
+  });
+
+  it("treats a bare line feed from a raw PTY as a new line", () => {
+    expect(renderTerminalScreen("abc\n\x1b[2Gx")).toBe("abc\n x");
+    expect(renderTerminalScreen("abc\ndef")).toBe("abc\ndef");
+  });
+
+  it("keeps OSC 8 display text and drops private-mode and charset sequences", () => {
+    const text = "\x1b[?2004h\x1b(B\x1b]8;;https://example.com\x07link\x1b]8;;\x07 ok\x0f";
+    expect(renderTerminalScreen(text)).toBe("link ok");
   });
 });
